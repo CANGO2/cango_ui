@@ -6,9 +6,8 @@ from rclpy.node import Node
 
 # 커스텀 메시지 포맷 임포트
 from cango_msgs.msg import RobotControl, LlmRequest, RobotStatus, SoundRequest
-from std_msgs.msg import String, Float32
 
-# 글로벌 접근을 위한 노드 및 차트 플레이스홀더
+# 글로벌 접근을 위한 노드 및 차트 전역 플레이스홀더
 node = None
 chart = None
 
@@ -36,7 +35,7 @@ def render_control_panel():
                 ui.html().bind_content_from(node.state, "joystick_svg")
                 
                 overlay_auto = ui.element('div').classes(
-                    'absolute inset-0 bg-slate-200/70 flex items-center justify-center rounded'
+                    'absolute inset-0 bg-slate-200/70 flex items-center justify-center rounded z-30'
                 )
                 with overlay_auto:
                     ui.label('비활성화').classes('text-[10px] font-bold text-slate-500 bg-white px-2 py-0.5 rounded shadow-sm')
@@ -48,7 +47,7 @@ def render_control_panel():
                 ui.html().bind_content_from(node.state, "lever_svg")
                 
                 overlay_manual = ui.element('div').classes(
-                    'absolute inset-0 bg-slate-200/70 flex items-center justify-center rounded'
+                    'absolute inset-0 bg-slate-200/70 flex items-center justify-center rounded z-30'
                 )
                 with overlay_manual:
                     ui.label('비활성화').classes('text-[10px] font-bold text-slate-500 bg-white px-2 py-0.5 rounded shadow-sm')
@@ -100,92 +99,95 @@ class RobotWebUI(Node):
         self.state = {
             "joystick_svg": "",
             "lever_svg": "",
-            "robot_vector_svg": "",
+            "robot_vector_svg": "", 
             "mode_html": "",
             "stand_html": ""
         }
 
         self.llm_messages = [{"text": "로봇 명령 대기중입니다.", "sent": False}]
 
-        # 내부 메모리 버퍼 추가 (차트 데이터 실시간 스크롤 유지를 위한 큐)
         self.chart_angle_buffer = []
         self.chart_torque_buffer = []
         self.chart_x_buffer = []
 
         self.update_graphics()
         self.update_status_html()
-        self.update_robot_vector(0.0, 0.0)
+        self.update_robot_vector(0.0, 0.0, 0.0)
 
         # --- ROS 2 토픽 퍼블리셔/구독자 설정 ---
         self.ui_text_pub = self.create_publisher(SoundRequest, "/llm_ui_text", 10)
 
         self.llm_request_sub = self.create_subscription(LlmRequest, "/cango/master2llm", self.llm_request_callback, 10)
+        self.llm2master_sub = self.create_subscription(LlmRequest, "/cango/llm2master", self.llm2master_callback, 10)
         self.control_sub = self.create_subscription(RobotControl, "/cango/master2control", self.control_callback, 10)
         self.status_sub = self.create_subscription(RobotStatus, "/cango/robot_status", self.robot_status_callback, 10)
-        
-        # ⭐️ [요청 반영] 토픽 이름을 /cango/tts_input 에서 /sound2ui 로 전면 수정 완료
         self.tts_sub = self.create_subscription(SoundRequest, "/cango/sound2ui", self.tts_input_callback, 10)
 
         @ui.page('/')
         def index():
+            global chart
+            chart = None  # 새로고침 시 구형 차트 세션 해제
             self.build_ui()
 
         self.get_logger().info("=== CANGO Robot GCS Node Initialization Complete ===")
 
     def trigger_ui_refresh(self):
-        render_top_buttons.refresh()
-        render_control_panel.refresh()
-        render_rviz_boxes.refresh()
-        render_chat.refresh()
+        try:
+            render_top_buttons.refresh()
+            render_control_panel.refresh()
+            render_rviz_boxes.refresh()
+            render_chat.refresh()
+        except:
+            pass
 
     # --- ROS 2 콜백 함수부 ---
     
+    def llm2master_callback(self, msg):
+        try:
+            if hasattr(msg, 'goalpoint') and msg.goalpoint:
+                self.goal_location = msg.goalpoint
+            elif hasattr(msg, 'goal_point') and msg.goal_point:  
+                self.goal_location = msg.goal_point
+                
+            self.get_logger().info(f"📬 [llm2master] 목적지 수신 완료 -> {self.goal_location}")
+            render_rviz_boxes.refresh()
+        except Exception as e:
+            self.get_logger().error(f"❌ llm2master_callback 처리 중 에러: {e}")
+
     def robot_status_callback(self, msg):
-        """ /robot_status 토픽 수신 시 브라우저 JS 엔진 직접 제어로 실시간 밀어내기 강제 수행 """
         global chart
         try:
             raw_x = getattr(msg, 'joystick_x', 512.0)
             raw_y = getattr(msg, 'joystick_y', 500.0)
             dyn_angle = getattr(msg, 'dynamixel_angle_deg', 134.0)
 
-            # -----------------------------------------------------------------
-            # 💡 [버그 완벽 픽스] run_chart_method를 사용해 브라우저 렌더링 동결 해제
-            # -----------------------------------------------------------------
             if chart is not None:
-                r_angle = getattr(msg, 'robstride_angle_deg', 0.0)
-                r_torque = getattr(msg, 'robstride_torque_nm', 0.0)
-                
-                # 내부 클래스 버퍼에 데이터 적재
-                self.chart_angle_buffer.append(float(r_angle))
-                self.chart_torque_buffer.append(float(r_torque))
-                self.chart_x_buffer.append("")
-                
-                # 30개가 넘어가면 실시간 스크롤이 되도록 맨 앞 슬롯 데이터를 삭제
-                if len(self.chart_angle_buffer) > 30:
-                    self.chart_angle_buffer.pop(0)
-                    self.chart_torque_buffer.pop(0)
-                    self.chart_x_buffer.pop(0)
-                
-                # ⭐️ 핵심 기법: 파이썬 사전을 거치지 않고 웹 브라우저 차트 객체에 바로 주입하여 흐르게 만듦
-                chart.run_chart_method('setOption', {
-                    "xAxis": {"data": self.chart_x_buffer},
-                    "series": [
-                        {"data": self.chart_angle_buffer},
-                        {"data": self.chart_torque_buffer}
-                    ]
-                })
+                try:
+                    r_angle = getattr(msg, 'robstride_angle_deg', 0.0)
+                    r_torque = getattr(msg, 'robstride_torque_nm', 0.0)
+                    
+                    self.chart_angle_buffer.append(float(r_angle))
+                    self.chart_torque_buffer.append(float(r_torque))
+                    self.chart_x_buffer.append("")
+                    
+                    if len(self.chart_angle_buffer) > 30:
+                        self.chart_angle_buffer.pop(0)
+                        self.chart_torque_buffer.pop(0)
+                        self.chart_x_buffer.pop(0)
+                    
+                    chart.run_chart_method('setOption', {
+                        "xAxis": {"data": self.chart_x_buffer},
+                        "series": [
+                            {"data": self.chart_angle_buffer},
+                            {"data": self.chart_torque_buffer}
+                        ]
+                    })
+                except:
+                    chart = None  # 세션 끊김 시 에러 무시하고 비우기
 
-            # -----------------------------------------------------------------
-            # 수동 조종 모드 (조이스틱 활성화 상태)
-            # -----------------------------------------------------------------
             if not self.is_auto:
                 self.ui_joystick_side = -((raw_x - 512.0) / 512.0)
                 self.ui_joystick_linear = -((raw_y - 500.0) / 500.0)
-                pass
-
-            # -----------------------------------------------------------------
-            # 자율주행 모드 (레버 활성화 상태)
-            # -----------------------------------------------------------------
             else:
                 self.ui_joystick_side = 0.0
                 self.ui_joystick_linear = 0.0
@@ -205,7 +207,8 @@ class RobotWebUI(Node):
             self.update_graphics()
 
         except Exception as e:
-            self.get_logger().error(f"❌ robot_status_callback 연산 중 에러: {e}")
+            if "deleted" not in str(e):
+                self.get_logger().error(f"❌ robot_status_callback 연산 중 에러: {e}")
 
     def control_callback(self, msg):
         try:
@@ -223,23 +226,34 @@ class RobotWebUI(Node):
             if hasattr(msg, 'robot_up') and msg.robot_up is not None:
                 self.is_stand = bool(msg.robot_up)
 
-            if self.is_auto:
-                self.ui_joystick_linear, self.ui_joystick_side = 0.0, 0.0
+            # 토픽 속성 안전 파싱
+            ctrl_linear = 0.0
+            if hasattr(msg, 'linear_speed'): ctrl_linear = float(msg.linear_speed)
+            elif hasattr(msg, 'linear'): ctrl_linear = float(msg.linear)
 
-            ctrl_linear = getattr(msg, 'linear_speed', 0.0) 
-            ctrl_side = getattr(msg, 'side_speed', 0.0)
+            ctrl_side = 0.0
+            if hasattr(msg, 'side_speed'): ctrl_side = float(msg.side_speed)
+            elif hasattr(msg, 'side'): ctrl_side = float(msg.side)
 
-            self.update_robot_vector(ctrl_linear, ctrl_side)
+            ctrl_angular = 0.0
+            if hasattr(msg, 'ang'): ctrl_angular = float(msg.ang)
+            elif hasattr(msg, 'angular'): ctrl_angular = float(msg.angular)
+            elif hasattr(msg, 'angular_speed'): ctrl_angular = float(msg.angular_speed)
+            elif hasattr(msg, 'ang_speed'): ctrl_angular = float(msg.ang_speed)
+
+            # 데이터 가공 후 로컬 바인딩 딕셔너리만 업데이트
+            self.update_robot_vector(ctrl_linear, ctrl_side, ctrl_angular)
             self.update_graphics()
             self.update_status_html()
 
         except Exception as e:
-            self.get_logger().error(f"❌ control_callback 파싱 중 에러: {e}")
+            if "deleted" not in str(e):
+                self.get_logger().error(f"❌ control_callback 파싱 중 에러: {e}")
 
     def tts_input_callback(self, msg):
         try:
             raw_user = getattr(msg, 'user', "").strip()
-            raw_llm = getattr(msg, 'llm', "").strip()
+            raw_llm = getattr(msg, 'llm_text', "").strip()
             updated = False
 
             if raw_user:
@@ -281,9 +295,15 @@ class RobotWebUI(Node):
             self.start_location = msg.local_candi1 if msg.local_candi1 else msg.local_candi2
         else:
             self.start_location = ""
-        self.goal_location = msg.goalpoint if msg.goalpoint else ""
-        self.update_graphics()
-        self.update_status_html()
+        
+        if msg.goalpoint:
+            self.goal_location = msg.goalpoint
+            
+        try:
+            self.update_graphics()
+            self.update_status_html()
+        except:
+            pass
 
     # --- SVG 렌더링 엔진 부 ---
     
@@ -321,20 +341,69 @@ class RobotWebUI(Node):
         </svg>
         """
 
-    def update_robot_vector(self, linear, side):
+    def update_robot_vector(self, linear, side, angular):
         center_x, center_y = 125, 125
-        magnitude = math.sqrt(linear**2 + side**2)
-        if magnitude < 0.001:
-            self.state["robot_vector_svg"] = ""
-            return
+        try:
+            val_linear = float(linear)
+            val_side = float(side)
+            val_ang = float(angular)
+        except:
+            val_linear, val_side, val_ang = 0.0, 0.0, 0.0
 
-        scale_length = max(30, min(95, magnitude * 180)) 
-        angle = math.atan2(-linear, side)
-        end_x = center_x + scale_length * math.cos(angle)
-        end_y = center_y + scale_length * math.sin(angle)
+        # 1️⃣ [side 주행]
+        if abs(val_side) >= 0.0001:
+            rotate_deg = 90.0 if val_side >= 0 else -90.0
+            clamped_side = max(0.0, min(1.0, abs(val_side)))
+            arrow_length = 40.0 + (clamped_side * 75.0)  
+            
+            vector_line_html = f"""
+            <g transform="translate({center_x}, {center_y}) rotate({rotate_deg})">
+                <line x1="0" y1="0" x2="0" y2="-{arrow_length}" stroke="#ef4444" stroke-width="6" stroke-linecap="round"/>
+                <polygon points="0,-{arrow_length+14} 5,-{arrow_length} -5,-{arrow_length}" fill="#ef4444" />
+            </g>
+            """
 
-        self.state["robot_vector_svg"] = f"""
-        <line x1="{center_x}" y1="{center_y}" x2="{end_x}" y2="{end_y}" stroke="#ef4444" stroke-width="7" marker-end="url(#robot_arrow)" stroke-linecap="round"/>
+        # 2️⃣ [ang 주행 지시 벡터 계산]
+        else:
+            # -1.0 ~ 1.0 범위 기준 시원하게 가시성을 주기 위해 최대 좌우 90도 범위로 고정 확장
+            clamped_ang = max(-1.0, min(1.0, val_ang))
+            rotate_deg = clamped_ang * 90.0
+            
+            if val_linear < 0:
+                rotate_deg += 180.0
+
+            clamped_linear = max(0.0, min(1.0, abs(val_linear)))
+            arrow_length = 40.0 + (clamped_linear * 75.0)
+
+            vector_line_html = f"""
+            <g transform="translate({center_x}, {center_y}) rotate({rotate_deg})">
+                <line x1="0" y1="0" x2="0" y2="-{arrow_length}" stroke="#ef4444" stroke-width="6" stroke-linecap="round"/>
+                <polygon points="0,-{arrow_length+14} 5,-{arrow_length} -5,-{arrow_length}" fill="#ef4444" />
+            </g>
+            """
+
+        # 🚨 [완벽 해결 핵심] 직접 돔을 건드리지 않고, 동기화된 데이터 컨테이너 문자열만 교체합니다.
+        self.state["robot_vector_svg"] = self.get_base_svg_template(vector_line_html)
+
+    def get_base_svg_template(self, vector_line_html):
+        return f"""
+        <svg width="250" height="250" class="w-full h-full">
+            <circle cx="125" cy="125" r="40" stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-dasharray="4"/>
+            <circle cx="125" cy="125" r="80" stroke="#cbd5e1" stroke-width="1.5" fill="none" stroke-dasharray="4"/>
+            <circle cx="125" cy="125" r="115" stroke="#e2e8f0" stroke-width="1" fill="none"/>
+            <line x1="10" y1="125" x2="240" y2="125" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="2"/>
+            <line x1="125" y1="10" x2="125" y2="240" stroke="#e2e8f0" stroke-width="1" stroke-dasharray="2"/>
+            
+            <g transform="translate(95, 100)" opacity="0.35">
+                <rect x="5" y="15" width="50" height="35" rx="8" fill="#475569" />
+                <rect x="15" y="2" width="30" height="12" rx="4" fill="#334155" />
+                <circle cx="23" cy="8" r="3" fill="#cbd5e1" />
+                <circle cx="37" cy="8" r="3" fill="#cbd5e1" />
+                <rect x="0" y="10" width="8" height="45" rx="3" fill="#1e293b" />
+                <rect x="52" y="10" width="8" height="45" rx="3" fill="#1e293b" />
+            </g>
+            {vector_line_html}
+        </svg>
         """
 
     def update_status_html(self):
@@ -366,21 +435,10 @@ class RobotWebUI(Node):
 
                 with ui.card().classes("w-full p-4 bg-white shadow-sm rounded-lg items-center justify-center"):
                     ui.label("🤖 로봇 중심 출력 벡터").classes("text-xs font-bold text-slate-500 self-start mb-2")
-                    with ui.element('div').classes('relative w-[250px] h-[250px] bg-slate-100 rounded-full border border-slate-200 shadow-inner flex items-center justify-center'):
-                        ui.image('https://raw.githubusercontent.com/zaidalyafeai/zaidalyafeai.github.io/master/sketcher/mini_res/robot.png').classes('w-[100px] opacity-40 absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-10 pointer-events-none')
-                        with ui.html().classes('absolute inset-0 z-0 pointer-events-none'):
-                            ui.html("""
-                                <svg width="250" height="250" class="w-full h-full">
-                                    <defs>
-                                        <marker id="robot_arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="7" markerHeight="7" orient="auto">
-                                            <path d="M 0 1 L 10 5 L 0 9 z" fill="#ef4444"/>
-                                        </marker>
-                                    </defs>
-                                    <circle cx="125" cy="125" r="40" stroke="#cbd5e1" stroke-width="1" fill="none" stroke-dasharray="3"/>
-                                    <circle cx="125" cy="125" r="80" stroke="#cbd5e1" stroke-width="1" fill="none" stroke-dasharray="3"/>
-                                </svg>
-                            """)
-                        ui.html().bind_content_from(self.state, "robot_vector_svg").classes('absolute inset-0 z-20 pointer-events-none')
+                    
+                    with ui.element('div').classes('w-[250px] h-[250px] bg-slate-100 rounded-full border border-slate-200 shadow-inner flex items-center justify-center relative overflow-hidden'):
+                        # 🚨 [구조 대개조] 직접 할당 방식 철폐하고 전역 바인딩 구조로 완전 결속!
+                        ui.html().bind_content_from(self.state, "robot_vector_svg").classes('w-full h-full absolute inset-0')
 
             # COLUMN 2: 디지털 지도 영역
             with ui.column().classes("w-full md:w-[38%] gap-4"):
