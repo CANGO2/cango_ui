@@ -5,127 +5,297 @@ import rclpy
 from rclpy.node import Node
 
 # 커스텀 메시지 포맷 임포트
-from cango_msgs.msg import RobotControl, LlmRequest
+from cango_msgs.msg import RobotControl, LlmRequest, RobotStatus, SoundRequest
 from std_msgs.msg import String, Float32
+
+# 글로벌 접근을 위한 노드 및 차트 플레이스홀더
+node = None
+chart = None
+
+# ----------------------------------------------------------------------
+# 글로벌 리프레시 컴포넌트 데이터 바인딩 구조
+# ----------------------------------------------------------------------
+@ui.refreshable
+def render_top_buttons():
+    if node is None:
+        return
+    with ui.row().classes("w-full gap-2 text-center text-sm font-bold"):
+        ui.html().bind_content_from(node.state, "mode_html").classes("flex-1")
+        ui.html().bind_content_from(node.state, "stand_html").classes("flex-1")
+
+@ui.refreshable
+def render_control_panel():
+    if node is None:
+        return
+    with ui.card().classes("w-full p-4 bg-white shadow-sm rounded-lg"):
+        with ui.row().classes("w-full justify-around items-center relative"):
+            
+            # JOYSTICK UI BOX
+            with ui.column().classes("items-center p-2 border rounded relative w-[46%]"):
+                ui.label("JOYSTICK").classes("text-[10px] font-bold text-slate-400 mb-1")
+                ui.html().bind_content_from(node.state, "joystick_svg")
+                
+                overlay_auto = ui.element('div').classes(
+                    'absolute inset-0 bg-slate-200/70 flex items-center justify-center rounded'
+                )
+                with overlay_auto:
+                    ui.label('비활성화').classes('text-[10px] font-bold text-slate-500 bg-white px-2 py-0.5 rounded shadow-sm')
+                overlay_auto.bind_visibility_from(node, 'is_auto')
+
+            # ROTARY LEVER UI BOX
+            with ui.column().classes("items-center p-2 border rounded bg-slate-50 relative w-[46%]"):
+                ui.label("ROTARY LEVER").classes("text-[10px] font-bold text-slate-400 mb-1")
+                ui.html().bind_content_from(node.state, "lever_svg")
+                
+                overlay_manual = ui.element('div').classes(
+                    'absolute inset-0 bg-slate-200/70 flex items-center justify-center rounded'
+                )
+                with overlay_manual:
+                    ui.label('비활성화').classes('text-[10px] font-bold text-slate-500 bg-white px-2 py-0.5 rounded shadow-sm')
+                overlay_manual.bind_visibility_from(node, 'is_auto', backward=lambda x: not x)
+
+@ui.refreshable
+def render_rviz_boxes():
+    if node is None:
+        return
+    with ui.row().classes("w-full gap-2 mb-3"):
+        with ui.row().classes("flex-1 p-3 rounded border text-xs font-medium items-center justify-between").style("background-color: #f8fafc; border-color: #e2e8f0;"):
+            ui.label("출발 위치:")
+            ui.label().bind_text_from(node, "start_location", backward=lambda x: x if x else "데이터 대기 중...")
+
+        with ui.row().classes("flex-1 p-3 rounded border text-xs font-medium items-center justify-between").style("background-color: #f8fafc; border-color: #e2e8f0;"):
+            ui.label("목적지:")
+            ui.label().bind_text_from(node, "goal_location", backward=lambda x: x if x else "데이터 대기 중...")
+
+@ui.refreshable
+def render_chat():
+    if node is None:
+        return
+    for msg in node.llm_messages:
+        ui.chat_message(
+            text=msg["text"],
+            name="LLM Agent" if not msg["sent"] else "Operator",
+            sent=msg["sent"],
+            avatar="https://api.dicebear.com/7.x/bottts/svg?seed=cango" if not msg["sent"] else None,
+        )
 
 
 class RobotWebUI(Node):
 
     def __init__(self):
         super().__init__("robot_web_ui")
+        self.get_logger().info("=== CANGO Robot GCS Node Initializing ===")
 
-        # --- [1] ROS 2 토픽 구독 설정 ---
-        # 위치/대화 관련 정보는 /master2llm, 조종 모드는 /master2control 토픽에서 수신합니다.
-        self.llm_request_sub = self.create_subscription(
-            LlmRequest, "/master2llm", self.llm_request_callback, 10
-        )
+        # --- 상태 관리 내부 변수 ---
+        self.is_auto = False   
+        self.is_stand = False  
 
-        self.control_sub = self.create_subscription(
-            RobotControl, "/master2control", self.control_callback, 10
-        )
-        
-        # RMD 모터 실시간 전류값 수신 토픽 (우측 상단 그래프 렌더링용)
-        self.current_sub = self.create_subscription(
-            Float32, "/rmd_motor_current", self.motor_current_callback, 10
-        )
+        self.start_location = ""  
+        self.goal_location = ""   
 
-        # 조이스틱/레버 피드백 화면용 가상 데이터 바인딩 변수
         self.ui_joystick_linear = 0.0
         self.ui_joystick_side = 0.0
-        self.ui_lever_linear = 0.0
+        self.ui_lever_linear = -1.5 
 
-        # --- [2] 상태 관리 내부 변수 ---
-        self.is_auto = False   # RobotControl.mode == 0 일 때 True (Auto Driving)
-        self.is_stand = False  # LlmRequest.stand == 1 일 때 True (Stand)
+        self.state = {
+            "joystick_svg": "",
+            "lever_svg": "",
+            "robot_vector_svg": "",
+            "mode_html": "",
+            "stand_html": ""
+        }
 
-        self.start_location = ""  # local_candi1 ~ local_candi2 형태 가공 매핑 변수
-        self.goal_location = ""   # goalpoint 목적지 변수
+        self.llm_messages = [{"text": "로봇 명령 대기중입니다.", "sent": False}]
 
-        # SVG 동적 컴포넌트 렌더링용 데이터 문자열
-        self.joystick_svg = ""
-        self.lever_svg = ""
-        self.robot_vector_svg = ""
+        # 내부 메모리 버퍼 추가 (차트 데이터 실시간 스크롤 유지를 위한 큐)
+        self.chart_angle_buffer = []
+        self.chart_torque_buffer = []
+        self.chart_x_buffer = []
 
-        # LLM 기본 로깅 데이터 구조 초기화
-        self.llm_messages = [
-            {"text": "시스템이 시작되었습니다. CANGO 로봇 명령 대기 중.", "sent": False}
-        ]
-
-        # 초기 그래픽 및 데이터 셋 바인딩 후 웹 엔진 빌드
         self.update_graphics()
+        self.update_status_html()
         self.update_robot_vector(0.0, 0.0)
-        self.build_ui()
 
-    # --- [4] 모든 대시보드 인터락이 집중된 통합 콜백 제어 함수 ---
+        # --- ROS 2 토픽 퍼블리셔/구독자 설정 ---
+        self.ui_text_pub = self.create_publisher(SoundRequest, "/llm_ui_text", 10)
+
+        self.llm_request_sub = self.create_subscription(LlmRequest, "/cango/master2llm", self.llm_request_callback, 10)
+        self.control_sub = self.create_subscription(RobotControl, "/cango/master2control", self.control_callback, 10)
+        self.status_sub = self.create_subscription(RobotStatus, "/cango/robot_status", self.robot_status_callback, 10)
+        
+        # ⭐️ [요청 반영] 토픽 이름을 /cango/tts_input 에서 /sound2ui 로 전면 수정 완료
+        self.tts_sub = self.create_subscription(SoundRequest, "/cango/sound2ui", self.tts_input_callback, 10)
+
+        @ui.page('/')
+        def index():
+            self.build_ui()
+
+        self.get_logger().info("=== CANGO Robot GCS Node Initialization Complete ===")
+
+    def trigger_ui_refresh(self):
+        render_top_buttons.refresh()
+        render_control_panel.refresh()
+        render_rviz_boxes.refresh()
+        render_chat.refresh()
+
+    # --- ROS 2 콜백 함수부 ---
+    
+    def robot_status_callback(self, msg):
+        """ /robot_status 토픽 수신 시 브라우저 JS 엔진 직접 제어로 실시간 밀어내기 강제 수행 """
+        global chart
+        try:
+            raw_x = getattr(msg, 'joystick_x', 512.0)
+            raw_y = getattr(msg, 'joystick_y', 500.0)
+            dyn_angle = getattr(msg, 'dynamixel_angle_deg', 134.0)
+
+            # -----------------------------------------------------------------
+            # 💡 [버그 완벽 픽스] run_chart_method를 사용해 브라우저 렌더링 동결 해제
+            # -----------------------------------------------------------------
+            if chart is not None:
+                r_angle = getattr(msg, 'robstride_angle_deg', 0.0)
+                r_torque = getattr(msg, 'robstride_torque_nm', 0.0)
+                
+                # 내부 클래스 버퍼에 데이터 적재
+                self.chart_angle_buffer.append(float(r_angle))
+                self.chart_torque_buffer.append(float(r_torque))
+                self.chart_x_buffer.append("")
+                
+                # 30개가 넘어가면 실시간 스크롤이 되도록 맨 앞 슬롯 데이터를 삭제
+                if len(self.chart_angle_buffer) > 30:
+                    self.chart_angle_buffer.pop(0)
+                    self.chart_torque_buffer.pop(0)
+                    self.chart_x_buffer.pop(0)
+                
+                # ⭐️ 핵심 기법: 파이썬 사전을 거치지 않고 웹 브라우저 차트 객체에 바로 주입하여 흐르게 만듦
+                chart.run_chart_method('setOption', {
+                    "xAxis": {"data": self.chart_x_buffer},
+                    "series": [
+                        {"data": self.chart_angle_buffer},
+                        {"data": self.chart_torque_buffer}
+                    ]
+                })
+
+            # -----------------------------------------------------------------
+            # 수동 조종 모드 (조이스틱 활성화 상태)
+            # -----------------------------------------------------------------
+            if not self.is_auto:
+                self.ui_joystick_side = -((raw_x - 512.0) / 512.0)
+                self.ui_joystick_linear = -((raw_y - 500.0) / 500.0)
+                pass
+
+            # -----------------------------------------------------------------
+            # 자율주행 모드 (레버 활성화 상태)
+            # -----------------------------------------------------------------
+            else:
+                self.ui_joystick_side = 0.0
+                self.ui_joystick_linear = 0.0
+
+                target_max_scale = 0.83  
+
+                if dyn_angle <= 134.0:
+                    self.ui_lever_linear = -1.5
+                elif 134.0 < dyn_angle <= 160.0:
+                    ratio = (dyn_angle - 134.0) / (160.0 - 134.0)
+                    self.ui_lever_linear = -1.5 + ratio * (target_max_scale - (-1.5))
+                elif 160.0 < dyn_angle < 190.0:
+                    self.ui_lever_linear = target_max_scale
+                else:  
+                    self.ui_lever_linear = 1.5
+
+            self.update_graphics()
+
+        except Exception as e:
+            self.get_logger().error(f"❌ robot_status_callback 연산 중 에러: {e}")
+
     def control_callback(self, msg):
-        """ /master2control (RobotControl) 토픽에서 조종/자율 모드를 동기화 """
+        try:
+            raw_mode = getattr(msg, 'mode', None)
+            
+            if raw_mode is True or raw_mode == 1 or str(raw_mode).strip().lower() in ['true', '1', '1.0']:
+                current_mode = 0  
+            elif raw_mode is False or raw_mode == 0 or str(raw_mode).strip().lower() in ['false', '0', '0.0']:
+                current_mode = 1  
+            else:
+                current_mode = 0  
+                
+            self.is_auto = (current_mode == 0)
+            
+            if hasattr(msg, 'robot_up') and msg.robot_up is not None:
+                self.is_stand = bool(msg.robot_up)
 
-        # RobotControl.mode: 1 = 조종, 0 = 자율
-        self.is_auto = (msg.mode == 0)
+            if self.is_auto:
+                self.ui_joystick_linear, self.ui_joystick_side = 0.0, 0.0
 
-        if self.is_auto:
-            self.ui_joystick_linear, self.ui_joystick_side = 0.0, 0.0
-        else:
-            self.ui_lever_linear = 0.0
-        self.update_graphics()
+            ctrl_linear = getattr(msg, 'linear_speed', 0.0) 
+            ctrl_side = getattr(msg, 'side_speed', 0.0)
 
-        self.render_top_buttons.refresh()
-        self.render_control_panel.refresh()
-        ui.update()
+            self.update_robot_vector(ctrl_linear, ctrl_side)
+            self.update_graphics()
+            self.update_status_html()
+
+        except Exception as e:
+            self.get_logger().error(f"❌ control_callback 파싱 중 에러: {e}")
+
+    def tts_input_callback(self, msg):
+        try:
+            raw_user = getattr(msg, 'user', "").strip()
+            raw_llm = getattr(msg, 'llm', "").strip()
+            updated = False
+
+            if raw_user:
+                self.llm_messages.append({"text": raw_user, "sent": True})
+                updated = True
+            if raw_llm:
+                self.llm_messages.append({"text": raw_llm, "sent": False})
+                updated = True
+
+            if updated:
+                render_chat.refresh()
+        except Exception as e:
+            self.get_logger().error(f"❌ tts_input_callback 처리 오류: {e}")
+
+    def send_ui_text_message(self, text_value):
+        if not text_value.strip():
+            return
+        try:
+            self.llm_messages.append({"text": text_value, "sent": True})
+            render_chat.refresh()
+
+            pub_msg = SoundRequest()
+            pub_msg.request = True
+            pub_msg.ordered_num = 4  
+            pub_msg.text = str(text_value)
+            pub_msg.user = str(text_value)
+            pub_msg.llm = ""
+
+            self.ui_text_pub.publish(pub_msg)
+        except Exception as e:
+            self.get_logger().error(f"❌ UI 텍스트 퍼블리시 실패: {e}")
 
     def llm_request_callback(self, msg):
-        """ /master2llm (LlmRequest) 토픽을 단일 수신하여 모든 UI 상태를 동기화 """
-
-        # 1) 기립 상태 판단 (LlmRequest 메시지 내의 stand가 1일 때 일어남 상태 활성화)
-        self.is_stand = (msg.stand == 1)
-
-        # 3) 출발 위치 가공 처리: "local_candi1 ~ local_candi2"
+        if hasattr(msg, 'stand'):
+            self.is_stand = (msg.stand == 1)
         if msg.local_candi1 and msg.local_candi2:
             self.start_location = f"{msg.local_candi1} ~ {msg.local_candi2}"
         elif msg.local_candi1 or msg.local_candi2:
             self.start_location = msg.local_candi1 if msg.local_candi1 else msg.local_candi2
         else:
             self.start_location = ""
-
-        # 4) 목적지 추출
         self.goal_location = msg.goalpoint if msg.goalpoint else ""
-
         self.update_graphics()
+        self.update_status_html()
 
-        # 5) LLM 가상 대화창 로그 자동 생성 (목적지가 유효하게 들어왔을 때)
-        if msg.goalpoint:
-            log_text = f"🎯 목적지 탐색 요청 수신: [{msg.goalpoint}]"
-            if msg.waypoints:
-                log_text += f" (경유지: {', '.join(msg.waypoints)})"
-            
-            if not self.llm_messages or self.llm_messages[-1]["text"] != log_text:
-                self.llm_messages.append({"text": log_text, "sent": False})
-                self.render_chat.refresh()
-
-        # 6) 실시간 데이터 변경 통지에 따른 자성 비동기 UI 컴포넌트 일제 갱신
-        self.render_top_buttons.refresh()
-        self.render_control_panel.refresh()
-        self.render_rviz_boxes.refresh()
-        ui.update()
-
-    def motor_current_callback(self, msg):
-        current_time = self.get_clock().now().to_msg().sec
-        chart.options["series"][0]["data"].append([current_time, msg.data])
-        if len(chart.options["series"][0]["data"]) > 40:
-            chart.options["series"][0]["data"].pop(0)
-        chart.update()
-
-    # --- [5] SVG 동적 그래픽 기하학적 연산 메서드 ---
+    # --- SVG 렌더링 엔진 부 ---
+    
     def update_graphics(self):
-        # 1. 조이스틱 컴포넌트 연산
         js_center_x, js_center_y = 75, 75
         js_max_length = 35
         js_dx = self.ui_joystick_side * js_max_length
-        js_dy = -self.ui_joystick_linear * js_max_length
+        js_dy = -self.ui_joystick_linear * js_max_length  
         js_target_x = js_center_x + js_dx
         js_target_y = js_center_y + js_dy
 
-        self.joystick_svg = f"""
+        self.state["joystick_svg"] = f"""
         <svg width="150" height="150" class="mx-auto">
             <rect x="10" y="10" width="130" height="130" fill="#1e1e1e" rx="15" />
             <line x1="{js_center_x}" y1="{js_center_y}" x2="{js_target_x}" y2="{js_target_y}" stroke="#a3a3a3" stroke-width="16" stroke-linecap="round" />
@@ -133,7 +303,6 @@ class RobotWebUI(Node):
         </svg>
         """
 
-        # 2. 회전형 기계식 레버 컴포넌트 연산
         pivot_x, pivot_y = 35, 35
         lever_length = 100
         clipped_linear = max(-1.5, min(1.5, self.ui_lever_linear))
@@ -143,7 +312,7 @@ class RobotWebUI(Node):
         lv_target_x = pivot_x + lever_length * math.cos(angle_rad)
         lv_target_y = pivot_y + lever_length * math.sin(angle_rad)
 
-        self.lever_svg = f"""
+        self.state["lever_svg"] = f"""
         <svg width="150" height="150" class="mx-auto">
             <path d="M 20,20 L 140,20 L 140,35 L 35,35 L 35,140 L 20,140 Z" fill="#1e1e1e" />
             <path d="M 35,35 L 130,35 M 35,35 L 35,130" stroke="#404040" stroke-width="1.5" stroke-dasharray="3" />
@@ -153,183 +322,133 @@ class RobotWebUI(Node):
         """
 
     def update_robot_vector(self, linear, side):
-        """ 250x250 공간의 정중앙(125, 125) 점을 기준으로 출력 벡터 화살표 연산 """
         center_x, center_y = 125, 125
         magnitude = math.sqrt(linear**2 + side**2)
-        if magnitude < 0.01:
-            self.robot_vector_svg = ""
+        if magnitude < 0.001:
+            self.state["robot_vector_svg"] = ""
             return
 
-        scale_length = min(90, magnitude * 50)
+        scale_length = max(30, min(95, magnitude * 180)) 
         angle = math.atan2(-linear, side)
-        
         end_x = center_x + scale_length * math.cos(angle)
         end_y = center_y + scale_length * math.sin(angle)
 
-        self.robot_vector_svg = f"""
+        self.state["robot_vector_svg"] = f"""
         <line x1="{center_x}" y1="{center_y}" x2="{end_x}" y2="{end_y}" stroke="#ef4444" stroke-width="7" marker-end="url(#robot_arrow)" stroke-linecap="round"/>
         """
 
-    # --- [6] 웹 UI 레이아웃 대시보드 엔진 설계 ---
+    def update_status_html(self):
+        mode_text = "Auto Driving" if self.is_auto else "Operation"
+        mode_color = "bg-blue-500" if self.is_auto else "bg-green-500"
+        self.state["mode_html"] = f'<div class="p-3 rounded shadow-sm text-white {mode_color} text-center font-bold">{mode_text}</div>'
+
+        stand_text = "Stand" if self.is_stand else "Sit"
+        stand_color = "bg-green-500" if self.is_stand else "bg-red-500"
+        self.state["stand_html"] = f'<div class="p-3 rounded shadow-sm text-white {stand_color} text-center font-bold">{stand_text}</div>'
+
+    # --- UI 레이아웃 설계 빌더 ---
+    
     def build_ui(self):
+        global chart
         ui.query("body").style("background-color: #f1f5f9;")
 
         with ui.header().classes("bg-[#1e293b] text-white p-3 items-center shadow-md"):
             ui.label("⚙️ CANGO Robot GCS Dashboard").classes("text-lg font-bold tracking-wider")
 
+        ui.timer(0.1, self.trigger_ui_refresh)
+
         with ui.row().classes("w-full p-4 justify-between items-stretch gap-4"):
 
-            # ----------------------------------------------------------------------
-            # COLUMN 1: 제어 모드 버튼, 조이스틱/레버 피드백 및 로봇 벡터 레이어
-            # ----------------------------------------------------------------------
+            # COLUMN 1: 조작 판넬 및 화살표 출력 벡터
             with ui.column().classes("w-full md:w-[32%] gap-4"):
-                
-                # [상단 제어 상태 표시 라벨 블록]
-                @ui.refreshable
-                def render_top_buttons():
-                    # Sit(is_stand=False) 상태일 때 자율 및 수동조종 버튼(왼쪽 버튼) 구역 회색조 잠금 스타일 동적 연산
-                    auto_btn_style = "" if self.is_stand else "background-color: #e2e8f0; color: #94a3b8; opacity: 0.6; border: 1px solid #cbd5e1;"
-                    
-                    with ui.row().classes("w-full gap-2 text-center text-sm font-bold"):
-                        # 1) 자율/수동 운전 모드 디스플레이 (Sit 상태일 때 회색 블로킹 처리)
-                        if self.is_auto:
-                            ui.label("Auto Driving").classes("flex-1 p-3 rounded shadow-sm text-white bg-blue-500 transition-all").style(auto_btn_style)
-                        else:
-                            ui.label("Operation").classes("flex-1 p-3 rounded shadow-sm text-white bg-green-500 transition-all").style(auto_btn_style)
+                render_top_buttons()      
+                render_control_panel()    
 
-                        # 2) 기립 제어 모드 디스플레이 (Sit / Stand)
-                        if self.is_stand:
-                            ui.label("Stand").classes("flex-1 p-3 rounded shadow-sm text-white bg-green-500 transition-all")
-                        else:
-                            ui.label("Sit").classes("flex-1 p-3 rounded shadow-sm text-white bg-red-500 transition-all")
-
-                render_top_buttons()
-
-                # [조이스틱 및 회전 레버 피드백 패널]
-                @ui.refreshable
-                def render_control_panel():
-                    with ui.card().classes("w-full p-4 bg-white shadow-sm rounded-lg"):
-                        with ui.row().classes("w-full justify-around items-center relative"):
-                            
-                            # 조이스틱 서브 컴포넌트 구역 (Sit 상태 시 흐리게 락)
-                            js_style = "" if self.is_stand else "background-color: #e2e8f0; opacity: 0.6;"
-                            with ui.column().classes("items-center p-2 border rounded relative w-[46%]").style(js_style):
-                                ui.label("JOYSTICK").classes("text-[10px] font-bold text-slate-400 mb-1")
-                                ui.html(self.joystick_svg)
-                                with ui.element('div').classes('absolute inset-0 bg-slate-200/60 rounded flex items-center justify-center').bind_visibility_from(self, 'is_auto'):
-                                    ui.label('비활성화 (원점)').classes('text-[10px] font-bold text-slate-400 bg-white px-2 py-0.5 rounded shadow-sm')
-
-                            # 회전 레버 서브 컴포넌트 구역
-                            with ui.column().classes("items-center p-2 border rounded bg-slate-50 relative w-[46%]"):
-                                ui.label("ROTARY LEVER").classes("text-[10px] font-bold text-slate-400 mb-1")
-                                ui.html(self.lever_svg)
-                                with ui.element('div').classes('absolute inset-0 bg-slate-200/60 rounded flex items-center justify-center').bind_visibility_from(self, 'is_auto', backward=lambda x: not x):
-                                    ui.label('비활성화 (원점)').classes('text-[10px] font-bold text-slate-400 bg-white px-2 py-0.5 rounded shadow-sm')
-
-                render_control_panel()
-
-                # [로봇 이미지 및 중앙 정렬 출력 벡터 레이어]
                 with ui.card().classes("w-full p-4 bg-white shadow-sm rounded-lg items-center justify-center"):
                     ui.label("🤖 로봇 중심 출력 벡터").classes("text-xs font-bold text-slate-500 self-start mb-2")
-                    
                     with ui.element('div').classes('relative w-[250px] h-[250px] bg-slate-100 rounded-full border border-slate-200 shadow-inner flex items-center justify-center'):
-                        
-                        # 로봇 이미지를 absolute 제어로 프레임 정확한 가운데 배치 (z-10)
-                        ui.image('https://images.tuyatech.com/smart/robot/go2.png').classes('w-[130px] opacity-80 absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-10 pointer-events-none')
-                        
-                        # 기준 그리드 데코레이션용 배경 레이어
+                        ui.image('https://raw.githubusercontent.com/zaidalyafeai/zaidalyafeai.github.io/master/sketcher/mini_res/robot.png').classes('w-[100px] opacity-40 absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-10 pointer-events-none')
                         with ui.html().classes('absolute inset-0 z-0 pointer-events-none'):
                             ui.html("""
                                 <svg width="250" height="250" class="w-full h-full">
                                     <defs>
-                                        <marker id="robot_arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="5" markerHeight="5" orient="auto-start-reverse">
-                                            <path d="M 0 0 L 10 5 L 0 10 z" fill="#ef4444"/>
+                                        <marker id="robot_arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+                                            <path d="M 0 1 L 10 5 L 0 9 z" fill="#ef4444"/>
                                         </marker>
                                     </defs>
                                     <circle cx="125" cy="125" r="40" stroke="#cbd5e1" stroke-width="1" fill="none" stroke-dasharray="3"/>
                                     <circle cx="125" cy="125" r="80" stroke="#cbd5e1" stroke-width="1" fill="none" stroke-dasharray="3"/>
                                 </svg>
                             """)
-                        
-                        # 실시간으로 변경되는 빨간색 출력 벡터 레이어 배치 (z-20)
-                        ui.html().bind_content_from(self, "robot_vector_svg").classes('absolute inset-0 z-20 pointer-events-none')
+                        ui.html().bind_content_from(self.state, "robot_vector_svg").classes('absolute inset-0 z-20 pointer-events-none')
 
-            # ----------------------------------------------------------------------
-            # COLUMN 2: RViz 내비게이션 시각화 영역 (Center)
-            # ----------------------------------------------------------------------
+            # COLUMN 2: 디지털 지도 영역
             with ui.column().classes("w-full md:w-[38%] gap-4"):
                 with ui.card().classes("w-full p-4 bg-white shadow-sm rounded-lg flex-grow flex flex-col"):
                     ui.label("🗺️ RViz 시각화").classes("text-base font-bold text-slate-700 mb-2")
-                    
-                    @ui.refreshable
-                    def render_rviz_boxes():
-                        with ui.row().classes("w-full gap-2 mb-3"):
-                            start_color = "background-color: #ffedd5; border-color: #fed7aa;" if self.start_location else "background-color: #f8fafc; border-color: #e2e8f0;"
-                            with ui.row().classes("flex-1 p-3 rounded border text-xs font-medium items-center justify-between").style(start_color):
-                                ui.label("출발 위치:")
-                                ui.label(self.start_location if self.start_location else "데이터 대기 중...")
-
-                            goal_color = "background-color: #ffedd5; border-color: #fed7aa;" if self.goal_location else "background-color: #f8fafc; border-color: #e2e8f0;"
-                            with ui.row().classes("flex-1 p-3 rounded border text-xs font-medium items-center justify-between").style(goal_color):
-                                ui.label("목적지:")
-                                ui.label(self.goal_location if self.goal_location else "데이터 대기 중...")
-
-                    render_rviz_boxes()
+                    render_rviz_boxes()  
 
                     with ui.element('div').classes('w-full flex-grow min-h-[380px] bg-slate-900 rounded-lg flex items-center justify-center border border-slate-800 relative overflow-hidden'):
                         ui.label("RViz 3D Map Viewport Link").classes("text-slate-500 font-mono text-sm z-10")
                         ui.icon("map", size="lg").classes("text-slate-700/40 absolute text-[120px] z-0")
 
-            # ----------------------------------------------------------------------
-            # COLUMN 3: RMD 모터 실시간 전류 트렌드 그래프 & AI 챗봇 영역 (Right)
-            # ----------------------------------------------------------------------
+            # COLUMN 3: Robstride 2중 차트 및 대화 창
             with ui.column().classes("w-full md:w-[27%] gap-4"):
-                
                 with ui.card().classes("w-full p-4 bg-white shadow-sm rounded-lg"):
-                    ui.label("⚡ rmd 모터 값").classes("text-sm font-bold text-slate-700")
+                    ui.label("⚡ Robstride 모터 데이터 추이").classes("text-sm font-bold text-slate-700")
                     
-                    global chart
                     chart = ui.echart(
                         {
-                            "title": {"text": "실시간 출력 트렌드 (Linear)", "textStyle": {"fontSize": 11, "color": "#64748b"}},
-                            "grid": {"top": 35, "bottom": 20, "left": 35, "right": 15},
-                            "xAxis": {"type": "value", "show": False},
-                            "yAxis": {"type": "value", "min": -5, "max": 5},
-                            "series": [{"data": [], "type": "line", "smooth": True, "color": "#f97316", "areaStyle": {"opacity": 0.1}}],
+                            "legend": {"data": ["각도 (deg)", "토크 (Nm)"], "top": 0, "textStyle": {"fontSize": 10}},
+                            "grid": {"top": 35, "bottom": 20, "left": 40, "right": 40},
+                            "xAxis": {"type": "category", "data": [], "show": False}, 
+                            "yAxis": [
+                                {"type": "value", "name": "deg", "min": -50, "max": 50, "position": "left"},  
+                                {"type": "value", "name": "Nm", "min": -2.5, "max": 2.5, "position": "right"}  
+                            ],
+                            "series": [
+                                {
+                                    "name": "각도 (deg)", 
+                                    "data": [], 
+                                    "type": "line", 
+                                    "smooth": True, 
+                                    "color": "#f97316",
+                                    "yAxisIndex": 0,
+                                    "showSymbol": True,
+                                    "symbolSize": 4
+                                },
+                                {
+                                    "name": "토크 (Nm)", 
+                                    "data": [], 
+                                    "type": "line", 
+                                    "smooth": True, 
+                                    "color": "#a855f7",
+                                    "yAxisIndex": 1,
+                                    "showSymbol": True,
+                                    "symbolSize": 4
+                                }
+                            ],
                         }
-                    ).classes("w-full h-40 mt-1")
+                    ).classes("w-full h-44 mt-1")
 
                 with ui.card().classes("w-full p-4 bg-white shadow-sm rounded-lg flex-grow flex flex-col"):
                     ui.label("💬 llm 기능").classes("text-sm font-bold text-slate-700 mb-2")
-                    
                     with ui.scroll_area().classes("w-full flex-grow h-64 border border-slate-100 p-3 rounded-lg bg-slate-50 shadow-inner"):
-                        @ui.refreshable
-                        def render_chat():
-                            for msg in self.llm_messages:
-                                ui.chat_message(
-                                    text=msg["text"],
-                                    name="LLM Agent" if not msg["sent"] else "Operator",
-                                    sent=msg["sent"],
-                                    avatar="https://api.dicebear.com/7.x/bottts/svg?seed=cango" if not msg["sent"] else None,
-                                )
-                        render_chat()
-                    
-                    self.render_chat = render_chat 
+                        render_chat()  
 
                     with ui.row().classes("w-full mt-2 items-center gap-1"):
                         cmd_input = ui.input(placeholder="로봇 지시어 입력...").classes("flex-grow text-xs").props("outlined dense")
                         
-                        def send_message_ui():
-                            if cmd_input.value:
-                                self.llm_messages.append({"text": cmd_input.value, "sent": True})
-                                self.llm_messages.append({"text": f"인식 완료: '{cmd_input.value}' 작업을 분석합니다.", "sent": False})
-                                cmd_input.value = ""
-                                render_chat.refresh()
-                        
-                        ui.button(icon="send", on_click=send_message_ui).props("flat color=primary")
+                        def handle_send_event():
+                            val = cmd_input.value
+                            if val and val.strip():
+                                self.send_ui_text_message(val)
+                                cmd_input.value = "" 
+                                
+                        ui.button(icon="send", on_click=handle_send_event).props("flat color=primary")
 
 
-# --- [7] ROS 2 비동기 구동 프로세서 루프 루틴 ---
+# --- ROS 2 비동기 구동 진입 루프 ---
 if not rclpy.utilities.ok():
     rclpy.init()
 
@@ -343,4 +462,4 @@ async def ros_loop():
 app.on_startup(ros_loop)
 
 if __name__ in {"__main__", "__mp_main__"}:
-    ui.run(title="CANGO GCS Dashboard", port=8080, reload=False, show=True)
+    ui.run(host="0.0.0.0", port=8080, reload=False, show=True)
