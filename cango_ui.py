@@ -367,10 +367,10 @@ class RobotWebUI(Node):
         else:
             # -1.0 ~ 1.0 범위 기준 시원하게 가시성을 주기 위해 최대 좌우 90도 범위로 고정 확장
             clamped_ang = max(-1.0, min(1.0, val_ang))
-            rotate_deg = clamped_ang * 90.0
-            
             if val_linear < 0:
-                rotate_deg += 180.0
+                rotate_deg = 180.0
+            else:
+                rotate_deg = clamped_ang * 90.0
 
             clamped_linear = max(0.0, min(1.0, abs(val_linear)))
             arrow_length = 40.0 + (clamped_linear * 75.0)
