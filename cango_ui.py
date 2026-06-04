@@ -115,7 +115,7 @@ class RobotWebUI(Node):
         self.update_robot_vector(0.0, 0.0, 0.0)
 
         # --- ROS 2 토픽 퍼블리셔/구독자 설정 ---
-        self.ui_text_pub = self.create_publisher(SoundRequest, "/llm_ui_text", 10)
+        self.ui_text_pub = self.create_publisher(SoundRequest, "/cango/llm_ui_text", 10)
 
         self.llm_request_sub = self.create_subscription(LlmRequest, "/cango/master2llm", self.llm_request_callback, 10)
         self.llm2master_sub = self.create_subscription(LlmRequest, "/cango/llm2master", self.llm2master_callback, 10)
@@ -272,15 +272,12 @@ class RobotWebUI(Node):
         if not text_value.strip():
             return
         try:
-            self.llm_messages.append({"text": text_value, "sent": True})
-            render_chat.refresh()
-
             pub_msg = SoundRequest()
             pub_msg.request = True
             pub_msg.ordered_num = 4  
             pub_msg.text = str(text_value)
             pub_msg.user = str(text_value)
-            pub_msg.llm = ""
+            pub_msg.llm_text = ""
 
             self.ui_text_pub.publish(pub_msg)
         except Exception as e:
