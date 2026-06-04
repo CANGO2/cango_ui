@@ -5,7 +5,7 @@ import subprocess
 from io import BytesIO
 from mss import mss
 from PIL import Image, ImageDraw
-import pyautogui  # 💡 마우스 위치 추적용 (pip install pyautogui 필요)
+import pyautogui
 from nicegui import app, ui
 import rclpy
 from rclpy.node import Node
@@ -145,6 +145,15 @@ class RobotWebUI(Node):
             render_control_panel.refresh()
             render_rviz_boxes.refresh()
             render_chat.refresh()
+            self.scroll_chat_to_end()
+        except:
+            pass
+
+    def scroll_chat_to_end(self):
+        try:
+            ui.run_javascript(
+                "setTimeout(() => { const el = document.getElementById('chat-scroll'); if (el) { el.scrollTop = el.scrollHeight; const last = el.lastElementChild; if (last) { last.scrollIntoView({behavior: 'auto', block: 'end'}); } } }, 120);"
+            )
         except:
             pass
 
@@ -157,7 +166,7 @@ class RobotWebUI(Node):
                 self.goal_location = msg.goal_point
             render_rviz_boxes.refresh()
         except Exception as e:
-            self.get_logger().error(f"❌ llm2master_callback 에러: {e}")
+            self.get_logger().error(f"llm2master_callback 에러: {e}")
 
     def robot_status_callback(self, msg):
         global chart
@@ -215,7 +224,7 @@ class RobotWebUI(Node):
 
             ctrl_linear = float(getattr(msg, 'linear_speed', getattr(msg, 'linear', 0.0)))
             ctrl_side = float(getattr(msg, 'side_speed', getattr(msg, 'side', 0.0)))
-            ctrl_angular = float(getattr(msg, 'angular_speed', getattr(msg, 'angular', 0.0)))
+            ctrl_angular = float(getattr(msg, 'ang_speed', getattr(msg, 'angular', 0.0)))
 
             self.update_robot_vector(ctrl_linear, ctrl_side, ctrl_angular)
             self.update_graphics()
@@ -234,7 +243,9 @@ class RobotWebUI(Node):
             if raw_llm:
                 self.llm_messages.append({"text": raw_llm, "sent": False})
                 updated = True
-            if updated: render_chat.refresh()
+            if updated:
+                render_chat.refresh()
+                self.scroll_chat_to_end()
         except: pass
 
     def send_ui_text_message(self, text_value):
@@ -247,7 +258,7 @@ class RobotWebUI(Node):
             pub_msg.user = str(text_value)
             self.ui_text_pub.publish(pub_msg)
         except Exception as e:
-            self.get_logger().error(f"❌ UI 텍스트 퍼블리시 실패: {e}")
+            self.get_logger().error(f"UI 텍스트 퍼블리시 실패: {e}")
 
     def llm_request_callback(self, msg):
         if hasattr(msg, 'stand'): self.is_stand = (msg.stand == 1)
@@ -386,7 +397,7 @@ class RobotWebUI(Node):
 
                 with ui.card().classes("w-full p-4 bg-white shadow-sm rounded-lg flex-grow flex flex-col"):
                     ui.label("💬 llm 기능").classes("text-sm font-bold text-slate-700 mb-2")
-                    with ui.scroll_area().classes("w-full flex-grow h-64 border p-3 rounded-lg bg-slate-50"):
+                    with ui.element('div').classes("w-full flex-grow h-64 border p-3 rounded-lg bg-slate-50 overflow-auto chat-scroll").props("id=chat-scroll"):
                         render_chat()  
                     with ui.row().classes("w-full mt-2 items-center gap-1"):
                         cmd_input = ui.input(placeholder="로봇 지시어 입력...").classes("flex-grow text-xs").props("outlined dense")
@@ -411,7 +422,7 @@ async def screen_capture_loop():
     while True:
         if screen_image_element is not None:
             try:
-                # 1. wmctrl로 대문자 'RViz' 창 강제 조준
+                # 1. wmctrl로 
                 cmd_list = "DISPLAY=:0 wmctrl -l"
                 res_list = subprocess.check_output(cmd_list, shell=True).decode('utf-8')
                 
@@ -443,7 +454,6 @@ async def screen_capture_loop():
                     
                     img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
                     
-                    # 💡 [핵심 변경] SSH 환경에서도 로봇 PC 본체(:0)의 실제 물리 마우스 위치 강제 탈취
                     try:
                         cmd_mouse = "DISPLAY=:0 xdotool getmouselocation"
                         res_mouse = subprocess.check_output(cmd_mouse, shell=True).decode('utf-8')
@@ -496,5 +506,4 @@ app.on_startup(ros_loop)
 app.on_startup(screen_capture_loop)
 
 if __name__ in {"__main__", "__mp_main__"}:
-    # 💡 show=False 설정을 통해 터미널 실행 시 우분투 브라우저 창이 강제로 열리는 현상을 완벽히 차단합니다.
     ui.run(host="0.0.0.0", port=8080, reload=False, show=False)
