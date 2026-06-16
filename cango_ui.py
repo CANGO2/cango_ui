@@ -5,7 +5,7 @@ import subprocess
 from io import BytesIO
 from mss import mss
 from PIL import Image, ImageDraw
-import pyautogui
+import pyautogui  # 💡 마우스 위치 추적용 (pip install pyautogui 필요)
 from nicegui import app, ui
 import rclpy
 from rclpy.node import Node
@@ -166,7 +166,7 @@ class RobotWebUI(Node):
                 self.goal_location = msg.goal_point
             render_rviz_boxes.refresh()
         except Exception as e:
-            self.get_logger().error(f"llm2master_callback 에러: {e}")
+            self.get_logger().error(f"❌ llm2master_callback 에러: {e}")
 
     def robot_status_callback(self, msg):
         global chart
@@ -258,7 +258,7 @@ class RobotWebUI(Node):
             pub_msg.user = str(text_value)
             self.ui_text_pub.publish(pub_msg)
         except Exception as e:
-            self.get_logger().error(f"UI 텍스트 퍼블리시 실패: {e}")
+            self.get_logger().error(f"❌ UI 텍스트 퍼블리시 실패: {e}")
 
     def llm_request_callback(self, msg):
         if hasattr(msg, 'stand'): self.is_stand = (msg.stand == 1)
@@ -422,7 +422,7 @@ async def screen_capture_loop():
     while True:
         if screen_image_element is not None:
             try:
-                # 1. wmctrl로 
+                # 1. wmctrl로 대문자 'RViz' 창 강제 조준
                 cmd_list = "DISPLAY=:0 wmctrl -l"
                 res_list = subprocess.check_output(cmd_list, shell=True).decode('utf-8')
                 
@@ -454,6 +454,7 @@ async def screen_capture_loop():
                     
                     img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
                     
+                    # 💡 [핵심 변경] SSH 환경에서도 로봇 PC 본체(:0)의 실제 물리 마우스 위치 강제 탈취
                     try:
                         cmd_mouse = "DISPLAY=:0 xdotool getmouselocation"
                         res_mouse = subprocess.check_output(cmd_mouse, shell=True).decode('utf-8')
@@ -506,4 +507,5 @@ app.on_startup(ros_loop)
 app.on_startup(screen_capture_loop)
 
 if __name__ in {"__main__", "__mp_main__"}:
+    # 💡 show=False 설정을 통해 터미널 실행 시 우분투 브라우저 창이 강제로 열리는 현상을 완벽히 차단합니다.
     ui.run(host="0.0.0.0", port=8080, reload=False, show=False)
